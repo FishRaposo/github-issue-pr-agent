@@ -27,10 +27,10 @@ jobs:
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
     - name: Lint with Ruff
-      run: ruff check .
+      run: ruff check src/issue_pr_agent tests examples alembic
 
     - name: Format Check with Ruff
-      run: ruff format --check .
+      run: ruff format --check src/issue_pr_agent tests examples alembic
 
     - name: Run Tests
       run: pytest

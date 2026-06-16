@@ -2,117 +2,100 @@
 
 ## What This Is
 
-An autonomous agent that reads GitHub issues with a specific label, generates an LLM-powered implementation plan, edits code in a sandboxed target repository, runs the test suite, and opens a draft PR — all within strict safety boundaries (allowlisted repos, allowlisted paths, no main push, no merge, no secret access). Wave 3 project that will integrate with hermes-agent-framework, async-workflow-engine, and llm-cost-latency-monitor.
+An autonomous agent that reads a GitHub issue, generates an implementation plan,
+edits code in a sandboxed copy of a target repo under strict safety boundaries,
+runs the test suite, and — only after human approval — opens a **draft** PR.
+Offline-first (no keys / DB / broker required) and real-when-keyed (GitHub REST,
+OpenAI/Anthropic, PostgreSQL, Celery). Built on `shared-core` v1.3.0.
 
 ## Commands
 
 ```bash
-make install          # pip install -e ../shared-core && pip install -r requirements.txt
-make dev              # python src/issue_pr_agent/main.py (FastAPI on :8000)
-make test             # pytest (tests/test_core.py)
-make lint             # ruff check .
-make format           # ruff format .
-make typecheck        # pyright src/
-make docker-up        # docker compose up -d (Postgres pgvector:pg16 + Redis 7)
-make docker-down      # docker compose down
-make demo             # python examples/run_demo.py (runs mock issue-to-PR pipeline)
-make clean            # remove __pycache__, .pytest_cache, etc.
+make install      # pip install -e ../shared-core[dev,docparse] + this project ([dev])
+make dev          # python -m issue_pr_agent.main (FastAPI on :8000)
+make test         # pytest (full suite; ~5 min — subprocess pytest runs)
+make lint         # ruff check src/issue_pr_agent tests examples alembic
+make format       # ruff format src/issue_pr_agent tests examples alembic
+make typecheck    # pyright src/
+make demo         # python examples/run_demo.py (before/after walkthrough, exits 0)
+make worker       # celery -A issue_pr_agent.worker worker (needs a broker)
+make migrate      # alembic revision --autogenerate
+make upgrade      # alembic upgrade head
+make docker-up    # docker compose up -d (Postgres + Redis)
+make clean        # remove caches
 ```
 
 ## Entry Point
 
-`src/issue_pr_agent/main.py` — FastAPI app with `/health` endpoint. Imports `AppConfig` from `issue_pr_agent.config`, uses `shared_core.logging.setup_logging`, `shared_core.database.DatabaseManager`, `shared_core.redis.RedisManager`, and `shared_core.errors.BaseApplicationError`.
+`src/issue_pr_agent/main.py` — FastAPI app. Probes the DB on startup (lifespan) and
+selects the persistence backend. Endpoints: `POST /issues/process`,
+`POST /issues/{id}/approve`, `GET /runs`, `GET /runs/{id}`, `GET /audit`,
+`GET /health`.
 
 ## Source Modules
 
 ```
 src/issue_pr_agent/
-├── __init__.py        # Package docstring: "GitHub Issue-to-PR Automation Agent."
-├── main.py            # FastAPI app, /health endpoint, DB + Redis managers, error handler registration
-├── config.py          # AppConfig(BaseAppConfig) — APP_NAME = "github-issue-pr-agent"
-├── errors.py          # application_error_handler() — converts BaseApplicationError to JSON
-├── github.py          # MockGitHubClient — get_issue(), create_pull_request() (hardcoded mock data)
-├── planner.py         # CodePlanner — plan_changes(issue) returns step-by-step fix plan string
-├── editor.py          # CodeEditor — apply_fix(filepath) does string replacement on source files
-├── test_runner.py     # LocalTestRunner — run_tests() stub, always returns True
-└── worker.py          # Celery app config + sample_background_task(x, y) template task
+├── __init__.py       # package docstring
+├── config.py         # AppConfig(BaseAppConfig): GITHUB_MODE, allow/block globs,
+│                     #   protected branches, AUTO_APPROVE, sandbox path, DB timeout
+├── main.py           # FastAPI app + all endpoints + lifespan DB probe
+├── agent.py          # IssuePRAgent orchestrator + FixStrategy + approval gate
+├── planner.py        # CodePlanner + FixPlan (sim default / LLMClientFactory real)
+├── editor.py         # CodeEditor: allowlist + blocklist + sandbox containment
+├── git_ops.py        # GitOps: no-main guard, never push protected, never merge
+├── github.py         # MockGitHubClient + RealGitHubClient + build_github_client
+├── test_runner.py    # LocalTestRunner: subprocess pytest (shell=False, timeout)
+├── sandbox.py        # provision_sandbox / cleanup_sandbox (disposable repo copy)
+├── store.py          # InMemoryStore + DatabaseStore (runs + audit, same interface)
+├── db.py             # check_db (2s probe) + build_store (DB or in-memory)
+├── models.py         # AgentRun, AuditEntry (SQLAlchemy, shared_core Base)
+├── worker.py         # Celery process_issue_task + run_issue_pipeline (no-broker ok)
+├── audit.py          # thin AuditLog shim (canonical trail lives in store.py)
+└── errors.py         # re-exports shared_core.errors.application_error_handler
 ```
 
-## Planned Modules (Not Yet Implemented)
+## shared_core Usage
 
-When building out the full agent, expect these subpackages per the build plan:
+`config.BaseAppConfig`, `logging.setup_logging` + `RequestLoggingMiddleware`,
+`errors.application_error_handler` + typed errors, `health.check_health`,
+`database.{DatabaseManager,Base,UUIDMixin,TimestampMixin}`, `redis.RedisManager`,
+`clients.BaseHTTPClient` (GitHub REST), `llm.LLMClientFactory` (planner),
+`tasks.create_celery_app` (worker), `testing.MockDatabase` (tests).
 
-- `github/` — real GitHub API client (issues, branches, PRs), replaces MockGitHubClient
-- `planner/` — LLM-powered plan generation using Hermes agent framework
-- `editor/` — sandboxed file editing with allowlist enforcement
-- `test_runner/` — subprocess-based pytest execution with output parsing
-- `approvals/` — human-in-the-loop approval gate API
-- `audit/` — PostgreSQL-backed audit trail for all agent actions
+## Safety Boundaries (the point of the project)
 
-## Docker Services
+- **Editor**: every write passes `check_path` — sandbox containment (`Path.resolve`)
+  + allowlist + blocklist (`.github/**`, `.env*`, build/config, `**/secrets/**`).
+- **Git**: no create/commit/push on `main`/`master`; `merge` is a hard no-op.
+- **Approval gate**: pipeline stops at `awaiting_approval`; only
+  `approve_and_open_pr` creates a PR, always as a draft.
+- **Tests must pass** before a run is approvable.
+- **Audit**: every action (incl. refusals) is recorded to the store.
 
-- **postgres**: pgvector/pgvector:pg16 on `:5432` (container: `template_postgres`)
-- **redis**: redis:7-alpine on `:6379` (container: `template_redis`)
+See `docs/security.md` for secrets, tool/file boundaries, and prompt-injection.
 
-Note: container names still use the template prefix `template_*` — rename to `issue_pr_agent_*` when customizing.
+## Demo / Sandbox
 
-## Layout
+`demo_repo/` ships a buggy `calculator.py` (`divide` has no zero guard) and
+`test_calculator.py` with a failing case. The agent provisions a disposable copy,
+applies the fix, and the failing test flips to passing — the before/after the demo
+and `test_agent.py` verify.
 
-```
-github-issue-pr-agent/
-├── src/issue_pr_agent/       # Main source package (9 modules)
-├── tests/test_core.py        # Health endpoint test
-├── examples/run_demo.py      # Mock pipeline demo
-├── docs/                     # architecture.md, design-decisions.md, failure-modes.md, roadmap.md, security.md
-├── .github/workflows/ci.yml  # ruff check, ruff format --check, pytest
-├── docker-compose.yml        # Postgres + Redis
-├── Makefile                  # Standard targets
-├── .env.example              # Includes GITHUB_TOKEN
-├── pyproject.toml             # Project metadata
-├── requirements.txt          # Runtime dependencies
-├── ruff.toml                 # Lint config
-├── pyrightconfig.json        # Type checking config
-└── pytest.ini                # Test config
-```
+## Tests
 
-## Current State
+`tests/` — unit (every module), integration (e2e on demo_repo), API (every
+endpoint, success + error), worker, safety guards, golden planner output. All run
+with NO network / DB / keys. `MockDatabase` (SQLite) exercises the DB store.
 
-**Skeleton stage.** The project has the standard template structure with domain-specific stubs:
+## Tech / Containers
 
-- `MockGitHubClient` returns hardcoded issue data and fake PR URLs — not connected to real GitHub API
-- `CodePlanner` generates a static plan string — no LLM integration yet
-- `CodeEditor` does a literal string replacement — no allowlist checking, no AST-aware editing
-- `LocalTestRunner` always returns `True` — no subprocess execution
-- `worker.py` has a template `sample_background_task` — not wired to the issue processing pipeline
-- Only one API endpoint exists (`/health`)
-- No audit logging, no approval gate, no real configuration for target repos
-
-The demo (`examples/run_demo.py`) does work end-to-end with mock data.
-
-## Key Dependencies
-
-Beyond shared-core (config, database, redis, logging, errors):
-
-| Package | Purpose |
-|---------|---------|
-| `httpx` | HTTP client for GitHub REST API v3 (will replace mock client) |
-| `celery` | Background task queue for async issue processing |
-| `pyyaml` | Configuration parsing for allowlists and workflow definitions |
-| `sqlalchemy` | ORM for audit log persistence |
-
-**Future additions expected:**
-- `PyGithub` or raw `httpx` for full GitHub API coverage
-- Hermes agent framework integration (from `../hermes-agent-framework`)
-- LLM provider SDK (OpenAI/Anthropic) for plan generation
+FastAPI, Celery, SQLAlchemy + Alembic, httpx. Docker compose: `pgagent_postgres`
+(pgvector:pg16, :5432), `pgagent_redis` (redis:7, :6379).
 
 ## When to Update This AGENTS.md
 
-Update when:
-- `MockGitHubClient` is replaced with a real GitHub API client
-- New modules are added under `src/issue_pr_agent/` (especially the planned subpackages)
-- Allowlist enforcement is implemented in `CodeEditor`
-- New API endpoints are added beyond `/health`
-- Worker tasks are wired to the actual issue processing pipeline
-- Approval gate or audit logging is implemented
-- Docker Compose services change (e.g., adding a sandbox container for code execution)
-- Integration with hermes-agent-framework or async-workflow-engine is established
+- New modules under `src/issue_pr_agent/`, new endpoints, or new safety guards.
+- Changes to the allowlist/blocklist or approval flow.
+- Schema changes (add an Alembic revision under `alembic/versions/`).
+- New `shared_core` modules adopted, or the pinned version changes.

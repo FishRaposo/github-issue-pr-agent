@@ -1,56 +1,38 @@
-from unittest.mock import MagicMock
+"""Subprocess pytest runner tests against the real sandbox."""
 
-from issue_pr_agent.test_runner import LocalTestRunner
+from issue_pr_agent.editor import CodeEditor, Edit
+from issue_pr_agent.test_runner import LocalTestRunner, make_runner
+
+_DIVIDE_FIX = Edit(
+    find="def divide(a, b):\n    return a / b",
+    replace=(
+        "def divide(a, b):\n    if b == 0:\n        return None\n    return a / b"
+    ),
+)
 
 
 class TestLocalTestRunner:
-    def test_run_tests_with_pytest_found(self, monkeypatch):
-        import subprocess
+    def test_buggy_sandbox_fails(self, sandbox_no_git):
+        result = LocalTestRunner(cwd=sandbox_no_git).run_tests()
+        assert not result.passed
+        assert "failed" in result.summary
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "1 passed"
-        mock_result.stderr = ""
-        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: mock_result)
+    def test_fixed_sandbox_passes(self, sandbox_no_git):
+        CodeEditor(workspace_root=sandbox_no_git).apply_edits(
+            "calculator.py", [_DIVIDE_FIX]
+        )
+        result = LocalTestRunner(cwd=sandbox_no_git).run_tests()
+        assert result.passed
+        assert "passed" in result.summary
 
-        runner = LocalTestRunner()
-        result = runner.run_tests(".")
-        assert result["passed"] is True
+    def test_result_fields(self, sandbox_no_git):
+        result = LocalTestRunner(cwd=sandbox_no_git).run_tests()
+        d = result.to_dict()
+        assert set(d) >= {"passed", "returncode", "stdout", "stderr", "summary"}
 
-    def test_run_tests_with_pytest_failure(self, monkeypatch):
-        import subprocess
+    def test_make_runner_missing_path(self):
+        assert make_runner("/path/does/not/exist") is None
 
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-        mock_result.stdout = "1 failed"
-        mock_result.stderr = "AssertionError"
-        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: mock_result)
-
-        runner = LocalTestRunner()
-        result = runner.run_tests(".")
-        assert result["passed"] is False
-        assert "AssertionError" in result["stderr"]
-
-    def test_run_tests_pytest_not_found(self, monkeypatch):
-        import subprocess
-
-        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError))
-
-        runner = LocalTestRunner()
-        result = runner.run_tests(".")
-        assert result["passed"] is True
-
-    def test_run_tests_has_expected_fields(self, monkeypatch):
-        import subprocess
-
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "ok"
-        mock_result.stderr = ""
-        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: mock_result)
-
-        runner = LocalTestRunner()
-        result = runner.run_tests(".")
-        assert "passed" in result
-        assert "stdout" in result
-        assert "stderr" in result
+    def test_make_runner_existing_path(self, sandbox_no_git):
+        runner = make_runner(sandbox_no_git)
+        assert isinstance(runner, LocalTestRunner)

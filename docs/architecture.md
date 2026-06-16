@@ -1,80 +1,149 @@
-# Architectural Design - GitHub Issue-to-PR Agent
+# Architecture — github-issue-pr-agent
 
-This document outlines the architectural design, dataflow, and component interactions of the GitHub Issue-to-PR Agent.
-
----
-
-## 1. System Overview
-
-The GitHub Issue-to-PR Agent is an autonomous development bot designed to ingest GitHub issues, formulate code modifications, apply code patches locally, run regression test suites, and open draft pull requests. 
-
-The architecture is built on a step-by-step pipeline ensuring security gates (like path allowlists) are checked before any code edit occurs.
+This document describes the components, data flow, persistence model, and the
+offline-first / real-when-keyed strategy of the agent.
 
 ---
 
-## 2. Ingestion & Execution Workflow
+## 1. System overview
+
+The agent turns a GitHub issue into a **draft** pull request through a fixed,
+auditable pipeline. Each stage has a single responsibility and a corresponding
+safety boundary; no stage can be skipped, and no pull request can be created
+without passing every prior stage and a human approval gate.
 
 ```mermaid
-graph TD
-    subgraph GitHub
-        Issue[GitHub Issue]
-        PR[Draft Pull Request]
+flowchart TD
+    Client[API client / dashboard] -->|POST /issues/process| API[FastAPI main.py]
+    API -->|broker available| Worker[Celery worker.py]
+    API -->|no broker / sync=true| Pipeline
+    Worker --> Pipeline
+
+    subgraph Pipeline[IssuePRAgent.process_issue]
+        direction TB
+        GH[GitHub client] -->|fetch issue| Plan[CodePlanner]
+        Plan -->|FixPlan| Branch[GitOps.create_branch]
+        Branch -->|feature branch| Edit[CodeEditor.apply_edits]
+        Edit -->|sandboxed write| Commit[GitOps.commit]
+        Commit --> Test[LocalTestRunner.run_tests]
+        Test -->|pass| Gate{awaiting_approval}
+        Test -->|fail| Failed[status=failed]
     end
 
-    subgraph Agent Pipeline
-        Ingest[MockGitHubClient github.py] -->|1. Fetch Issue| Planner[CodePlanner planner.py]
-        Planner -->|2. Generate Plan| Sandbox[CodeEditor editor.py]
-        Sandbox -->|3. Apply Code Fix| Runner[LocalTestRunner test_runner.py]
-        Runner -->|4. Execute Tests| Ingest
-        Ingest -->|5. Create Draft PR| PR
-    end
+    Gate -.->|POST /issues/id/approve| Approve[approve_and_open_pr]
+    Approve -->|DRAFT PR| GH
 
-    subgraph Infrastructure
-        APIServer[main.py] --> DB[PostgreSQL]
-        APIServer --> Redis[Redis]
-    end
+    Pipeline -->|log every step| Store[(Store)]
+    Store --> Probe{DB reachable?}
+    Probe -->|yes| PG[(PostgreSQL)]
+    Probe -->|no| Mem[(In-memory)]
 ```
 
 ---
 
-## 3. Detailed Dataflow Sequence
+## 2. Components
+
+| Module | Class / fn | Responsibility | Safety boundary |
+|---|---|---|---|
+| `github.py` | `MockGitHubClient` / `RealGitHubClient`, `build_github_client` | Read issues, create branches, open draft PRs | Draft-only PRs; mock by default |
+| `planner.py` | `CodePlanner`, `FixPlan` | Produce a structured fix plan (sim or LLM) | Issue text treated as untrusted; no tool access |
+| `agent.py` | `IssuePRAgent`, `FixStrategy` | Orchestrate the pipeline + approval gate | Enforces ordering; PR only after approval |
+| `editor.py` | `CodeEditor`, `Edit` | Apply search/replace edits | Allowlist + blocklist + sandbox containment |
+| `git_ops.py` | `GitOps`, `GitResult` | Branch / commit / (refuse push+merge) | No-main guard; never push protected; never merge |
+| `test_runner.py` | `LocalTestRunner` | Run pytest in a subprocess | `shell=False`, arg list, timeout |
+| `sandbox.py` | `provision_sandbox` | Disposable repo copy | Pristine repo never edited in place |
+| `store.py` | `InMemoryStore` / `DatabaseStore` | Persist runs + audit | Append-only audit |
+| `db.py` | `check_db`, `build_store` | DB availability probe + backend select | 2s connect timeout, graceful fallback |
+| `models.py` | `AgentRun`, `AuditEntry` | SQLAlchemy schema | — |
+| `worker.py` | `process_issue_task`, `run_issue_pipeline` | Celery task wrapping the pipeline | Importable with no broker |
+| `main.py` | FastAPI app | HTTP surface | Typed errors, request logging |
+
+---
+
+## 3. Data flow (sequence)
 
 ```mermaid
 sequenceDiagram
-    participant GH as GitHub API / Client
-    participant App as API Server (main.py)
-    participant Plan as CodePlanner
-    participant Edit as CodeEditor
-    participant Test as TestRunner
+    participant C as Client
+    participant A as API (main.py)
+    participant W as Worker / pipeline
+    participant GH as GitHub client
+    participant P as Planner
+    participant E as Editor
+    participant G as GitOps
+    participant T as TestRunner
+    participant S as Store
 
-    App->>GH: get_issue(issue_id)
-    GH-->>App: Issue Payload (Title, Body, Labels)
-    App->>Plan: plan_changes(issue)
-    Note over Plan: Formulate file fix steps
-    Plan-->>App: Execution Plan text
-    App->>Edit: apply_fix(filepath)
-    Note over Edit: Verify allowlisted paths
-    Edit->>Edit: Apply target search-and-replace
-    Edit-->>App: Fix applied status
-    App->>Test: run_tests()
-    Note over Test: Execute pytest subprocess
-    Test-->>App: tests_passed (True/False)
-    App->>GH: create_pull_request(branch, title, body)
-    GH-->>App: Pull Request URL (draft)
+    C->>A: POST /issues/process {issue_id, repo}
+    A->>W: dispatch (Celery) or run sync
+    W->>S: create_run -> run_id (pending)
+    W->>GH: get_issue(issue_id)
+    GH-->>W: {title, body, labels}
+    W->>P: plan_changes(issue)
+    P-->>W: FixPlan (target_file, steps)
+    W->>G: create_branch(agent/fix-issue-N)   %% no-main guard
+    W->>E: apply_edits(target, edits)          %% allowlist + sandbox
+    E-->>W: EditResult(changed)
+    W->>G: commit(files)                        %% refuses on main
+    W->>T: run_tests()                          %% subprocess pytest
+    T-->>W: passed?
+    alt tests pass
+        W->>S: update_run(awaiting_approval)
+        W-->>C: run (no PR yet)
+        C->>A: POST /issues/{id}/approve
+        A->>GH: create_pull_request(draft=true)
+        GH-->>A: html_url
+        A->>S: update_run(completed, pr_url)
+    else tests fail
+        W->>S: update_run(failed)
+    end
 ```
 
 ---
 
-## 4. Module Breakdown
+## 4. Persistence model
 
-### 4.1 GitHub Client (`github.py`)
-- **`MockGitHubClient`**: Simulates communication with the GitHub API. In production, this utilizes PyGithub or standard requests to fetch issue details and submit pull requests.
+Two tables, created automatically via `DatabaseManager.create_tables()` when a
+database is reachable (and also managed by Alembic for production):
 
-### 4.2 Code Planner (`planner.py`)
-- **`CodePlanner`**: Analyzes the issue content (such as bug descriptions) and generates a step-by-step text instruction mapping which files need modification and how to apply the fix.
+- **`agent_runs`** — one row per run: lifecycle `status`, the generated `plan`,
+  `branch`, `files_changed` (JSON), `tests_passed`, `approved`, `pr_url`, `error`.
+- **`audit_entries`** — append-only, foreign-keyed to a run: `action`, `actor`,
+  `details` (JSON), timestamp.
 
-### 4.3 Code Editor (`editor.py`)
-- **`CodeEditor`**: Handles files edits. It implements search-and-replace algorithms to apply patches. It must validate that target filepaths fall within strict safety directories.
+`InMemoryStore` and `DatabaseStore` implement the **same interface** (`create_run`,
+`update_run`, `get_run`, `list_runs`, `log_action`, `get_audit`) so the API, worker,
+and demo are agnostic to the backend. `db.check_db()` probes connectivity with a 2s
+connect timeout on startup; on any failure it logs a warning and the service uses
+the in-memory store.
 
-### 4.4 Local Test Runner (`test_runner.py`)
-- **`LocalTestRunner`**: Spawns local test environments (e.g. executing `pytest` via `subprocess`) and parses the terminal exit codes and console logs to verify that the code edits did not break the build.
+---
+
+## 5. Offline-first / real-when-keyed
+
+Every external dependency has a deterministic default and a real path behind a
+config flag or key:
+
+| Dependency | Offline default | Real path |
+|---|---|---|
+| GitHub | `MockGitHubClient` (deterministic issues, synthetic PR URL) | `RealGitHubClient` via `BaseHTTPClient` when `GITHUB_MODE=real` + token |
+| LLM plan | `CodePlanner` simulator (deterministic `FixPlan`) | `LLMClientFactory` (OpenAI/Anthropic) when a key is set |
+| Database | `InMemoryStore` | `DatabaseStore` when `DATABASE_URL` is reachable |
+| Task queue | synchronous in-process | Celery dispatch when a broker is reachable |
+
+This mirrors the `mocked_response` short-circuit pattern used across the showcase
+(`llm-cost-latency-monitor/sdk.py`): a mock/sim hint is honored first, otherwise the
+real provider is attempted with a graceful fallback to simulation on `ImportError`
+or missing key.
+
+---
+
+## 6. Why a fixed `FixStrategy`
+
+Applying arbitrary LLM-generated patches to a repo is the genuinely risky part of
+a coding agent. To keep the showcase deterministic, repeatable, and safe, the agent
+applies an explicit `FixStrategy` (search/replace `Edit`s) that still flows through
+the **same** safety gate (`CodeEditor.check_path`) any real patch would. The planner
+produces a real plan; wiring the plan's output into validated edits is the first
+roadmap item. This separation lets the safety model be exercised and tested today
+without trusting model output to touch disk.

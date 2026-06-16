@@ -1,0 +1,9 @@
+Alembic migrations for github-issue-pr-agent.
+
+The schema (agent_runs, audit_entries) is also created automatically at runtime
+via DatabaseManager.create_tables() when the database is reachable, so the agent
+runs with no manual migration step. These migrations exist for production-style
+deployments that prefer explicit, versioned schema management.
+
+Apply migrations:   alembic upgrade head
+Create a revision:  alembic revision --autogenerate -m "message"

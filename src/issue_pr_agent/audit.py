@@ -1,44 +1,41 @@
-import json
-import os
+"""Audit-log compatibility shim.
+
+The canonical audit trail now lives in :mod:`issue_pr_agent.store` (in-memory or
+DB-backed, selected by the availability probe). This module keeps a tiny
+process-local :class:`AuditLog` for ad-hoc logging and backwards compatibility;
+new code should use the active store's ``log_action`` / ``get_audit`` instead.
+"""
+
 import time
-from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from loguru import logger
 
 
 class AuditLog:
-    """Records agent actions with timestamps for traceability."""
+    """Minimal in-process audit log (delegates the real trail to the store)."""
 
-    def __init__(self, log_path: str = "audit.jsonl"):
-        self.log_path = Path(log_path)
+    def __init__(self) -> None:
+        self._entries: list[dict[str, Any]] = []
 
     def log_action(
         self,
         action: str,
-        details: dict[str, Any] | None = None,
-        user: str = "system",
-    ) -> None:
+        details: Optional[dict[str, Any]] = None,
+        actor: str = "system",
+    ) -> dict[str, Any]:
         entry = {
             "timestamp": time.time(),
             "action": action,
-            "user": user,
+            "actor": actor,
             "details": details or {},
         }
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        self._entries.append(entry)
         logger.info(f"Audit: {action}")
+        return entry
 
-    def get_logs(self, limit: int = 100) -> list[dict]:
-        if not self.log_path.exists():
-            return []
-        entries: list[dict] = []
-        with open(self.log_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    entries.append(json.loads(line))
-        return entries[-limit:]
+    def get_logs(self, limit: int = 100) -> list[dict[str, Any]]:
+        return list(self._entries[-limit:])
 
 
 audit_log = AuditLog()

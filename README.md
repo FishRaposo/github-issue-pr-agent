@@ -1,195 +1,167 @@
-# GitHub Issue-to-PR Agent
+# github-issue-pr-agent
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?logo=fastapi&logoColor=white)
 ![GitHub API](https://img.shields.io/badge/GitHub_API-v3-181717?logo=github&logoColor=white)
-![Celery](https://img.shields.io/badge/Celery-5.3+-37814A?logo=celery&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-blue)
 
-**An autonomous agent that reads GitHub issues, generates implementation plans, edits code in a sandboxed repository, runs tests, and opens draft pull requests — with strict safety boundaries at every step.**
+> An autonomous agent that reads a GitHub issue, plans a fix, edits code in a sandbox under strict safety guards, runs the test suite, and — only after human approval — opens a **draft** pull request.
 
-## Why This Exists
+## Why
 
-Developer workflows are drowning in low-complexity, high-volume issues — typo fixes, missing input validation, simple refactors. These issues are well-scoped enough for automated resolution, but existing tools either lack safety guarantees or require deep integration into proprietary CI systems.
+Coding agents are powerful and dangerous in the same breath: the moment you give one write access to a repository, a hallucinated edit, a path-traversal slip, or an over-eager merge can do real damage. This project demonstrates how to wrap an LLM-driven code-fixing loop in **defense-in-depth safety boundaries** so the autonomy is bounded, auditable, and reversible:
 
-This project demonstrates that an AI-powered agent can safely bridge the gap between "issue filed" and "draft PR ready for review" without ever touching production branches, accessing secrets, or merging code autonomously. The key constraint is that every action is auditable, every target is allowlisted, and humans remain the final approvers.
+- it edits **only allowlisted paths** in a **disposable sandbox** copy of the repo,
+- it **never commits to or pushes** `main`/`master`, and **never merges**,
+- it **proves the fix with a real test run** before proposing anything,
+- it **opens nothing without explicit approval** — a human gates every PR,
+- and **every action is written to an append-only audit trail**.
 
-## What It Demonstrates
+## What it demonstrates
 
-- **GitHub API Integration** — reading issues by label, creating branches, opening draft PRs via the REST API
-- **Agent Pipeline Orchestration** — chaining issue parsing → plan generation → code editing → test execution → PR creation into a single automated workflow
-- **Safety-First Code Editing** — allowlisted repositories and file paths prevent the agent from modifying anything outside its sandbox
-- **Automated Test Execution** — running the target repo's test suite after edits and gating PR creation on passing results
-- **Human-in-the-Loop Approval** — draft PRs only, no merges, no pushes to `main`, explicit review required
-- **Audit Trail Design** — every agent action logged with timestamps, inputs, outputs, and risk assessments
-- **Celery Background Processing** — issue processing happens asynchronously via Redis-backed task queue
-- **Structured Error Handling** — shared-core `BaseApplicationError` hierarchy for consistent API error responses
+- **Offline-first, real-when-keyed.** Runs end to end with **no API keys, no database, and no broker** using deterministic mocks/sims. Flip `GITHUB_MODE=real` + a token to hit the real GitHub REST API, and set `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` to plan with a real LLM — both via `shared_core`.
+- **A real safety model**, not a toy: allowlist/blocklist globs, sandbox containment (traversal + symlink escape blocked), a no-main git guard, and an approval gate.
+- **A real test-verification loop**: the agent runs `pytest` in a subprocess against the sandbox and refuses to proceed if tests fail.
+- **Durable, queryable state**: runs and the audit trail persist to PostgreSQL when available, with a transparent in-memory fallback so tests and the demo need no DB.
+- **A working before/after walkthrough** on a bundled `demo_repo` (a deliberately buggy `calculator.py` + a failing test that the agent's fix makes pass).
 
 ## Architecture
 
 ```mermaid
-graph TD
-    GH["GitHub Issues API"] -->|fetch labeled issues| IR["Issue Reader<br/>(github.py)"]
-    IR -->|issue payload| PL["Code Planner<br/>(planner.py)"]
-    PL -->|modification plan| ED["Code Editor<br/>(editor.py)"]
-    ED -->|edited files| TR["Test Runner<br/>(test_runner.py)"]
-    TR -->|pass/fail| AP["Approval Gate"]
-    AP -->|approved| PR["PR Creator<br/>(github.py)"]
-    PR -->|draft PR| GH
+flowchart TD
+    Client[API client / dashboard] -->|POST /issues/process| API[FastAPI main.py]
+    API -->|dispatch| Worker[Celery worker.py]
+    API -->|sync fallback no broker| Pipeline
+    Worker --> Pipeline
 
-    API["FastAPI Gateway<br/>(main.py)"] -->|enqueue| RQ["Redis Queue"]
-    RQ -->|dispatch| CW["Celery Worker<br/>(worker.py)"]
-    CW -->|orchestrate| IR
+    subgraph Pipeline[IssuePRAgent pipeline]
+        direction TB
+        GH[GitHub client<br/>mock or real] -->|1 fetch issue| Plan[CodePlanner<br/>sim or LLM]
+        Plan -->|2 FixPlan| Branch[GitOps<br/>no-main guard]
+        Branch -->|3 feature branch| Edit[CodeEditor<br/>allowlist + sandbox]
+        Edit -->|4 apply fix| Test[LocalTestRunner<br/>subprocess pytest]
+        Test -->|5 tests pass| Gate{Awaiting approval}
+    end
 
-    API -->|health, status| DB[(PostgreSQL)]
-    CW -->|audit log| DB
+    Gate -.->|POST /issues/id/approve| Approve[approve_and_open_pr]
+    Approve -->|6 DRAFT PR only after approval| GH
 
-    style AP fill:#ff9800,color:#000
-    style GH fill:#24292e,color:#fff
+    Pipeline -->|every step| Store[(Store:<br/>runs + audit)]
+    Store -->|DB probe 2s| PG[(PostgreSQL)]
+    Store -->|fallback| Mem[(In-memory)]
+
+    API -->|GET /runs /runs/id /audit| Store
 ```
 
-The pipeline follows a strict linear flow: **read → plan → edit → test → approve → PR**. Each stage produces an output that feeds the next, and any failure aborts the pipeline with an audit record explaining what went wrong and why.
+The pipeline stops at `awaiting_approval` after a successful test run. **No PR is opened** until `POST /issues/{id}/approve` (or `AUTO_APPROVE=true`) is called — that is the single code path that creates a pull request, and it always creates it as a **draft**.
 
-## Tech Stack
+### Run lifecycle
 
-| Component | Technology | Justification |
-|-----------|-----------|---------------|
-| API Framework | FastAPI + Uvicorn | Async-ready, Pydantic validation, auto-generated OpenAPI docs |
-| Task Queue | Redis + Celery | Decouples long-running issue processing from the API request cycle |
-| Database | PostgreSQL (pgvector:pg16) | Stores audit logs, issue tracking state, and plan history |
-| GitHub Client | httpx | Async HTTP client for GitHub REST API v3 calls |
-| Configuration | pydantic-settings | Type-safe config from `.env` files with validation |
-| Logging | loguru (via shared-core) | Structured logging with service name context |
-| Shared Library | [shared-core](../shared-core/) | Config, database, Redis, logging, and error utilities |
-| Linting | ruff + pyright | Fast linting, import sorting, and static type checking |
-| Testing | pytest | Unit and integration testing with FastAPI TestClient |
+```
+pending → planned → awaiting_approval → approved → completed
+                              │
+                              └── (tests fail) → failed
+```
 
-## Local Setup
+## Tech stack
+
+| Concern | Choice |
+|---|---|
+| API | FastAPI + Uvicorn |
+| Async tasks | Celery (via `shared_core.tasks.create_celery_app`) |
+| Persistence | SQLAlchemy + PostgreSQL, Alembic migrations, in-memory fallback |
+| LLM planning | `shared_core.llm.LLMClientFactory` (OpenAI/Anthropic), simulated by default |
+| GitHub | `shared_core.clients.BaseHTTPClient` against the REST API; deterministic mock by default |
+| Git ops | local `git` via `subprocess` |
+| Test verification | `pytest` in a subprocess |
+| Config / logging / errors / health | `shared_core` (`BaseAppConfig`, `setup_logging`, `application_error_handler`, `check_health`) |
+
+## Setup
 
 ```bash
-# Enter the project directory
-cd github-issue-pr-agent
+# 1. Create a virtualenv and install shared-core + this project
+python -m venv .venv
+.venv/Scripts/python -m pip install -e "../shared-core[dev,docparse]" numpy
+.venv/Scripts/python -m pip install -e ".[dev]" celery alembic
 
-# Copy environment template and configure
+# 2. (optional) copy env and customise
 cp .env.example .env
-# Edit .env to set GITHUB_TOKEN and LLM API keys
-
-# Start infrastructure (PostgreSQL + Redis)
-make docker-up
-
-# Install dependencies (installs shared-core first)
-make install
-
-# Run the API server
-make dev
-# → FastAPI running at http://localhost:8000
-
-# Verify health
-curl http://localhost:8000/health
 ```
+
+Everything works with the defaults — **no `.env`, no database, no keys required.**
+
+### Going real (optional)
+
+| Env var | Effect |
+|---|---|
+| `GITHUB_MODE=real` + `GITHUB_TOKEN=...` | Read issues / create branches / open draft PRs against real GitHub |
+| `OPENAI_API_KEY=...` or `ANTHROPIC_API_KEY=...` | Plan fixes with a real LLM instead of the simulator |
+| `DATABASE_URL=postgresql+psycopg://...` | Persist runs + audit to PostgreSQL (probed on startup) |
+| `CELERY_BROKER_URL=redis://...` | Dispatch `/issues/process` asynchronously to a worker |
+| `AUTO_APPROVE=true` | Skip the human gate (open the draft PR automatically once tests pass) |
 
 ## Demo
 
-The demo script in `examples/run_demo.py` simulates the full agent pipeline without requiring a live GitHub connection:
+```bash
+.venv/Scripts/python examples/run_demo.py
+```
+
+This provisions a disposable copy of `demo_repo`, shows the **before** state (tests fail on the division-by-zero bug), runs the agent pipeline for issue #101, shows the **after** state (tests pass), approves the run to open a draft PR, and prints the full audit trail. Exits `0`.
+
+Run the API instead:
 
 ```bash
-make demo
+.venv/Scripts/python -m issue_pr_agent.main      # serves on :8000
 ```
 
-**What it does:**
-1. Creates a temporary `calculator.py` file with a buggy `sum_numbers` function
-2. `MockGitHubClient.get_issue(101)` returns a sample bug report about empty list handling
-3. `CodePlanner.plan_changes()` generates a step-by-step fix plan
-4. `CodeEditor.apply_fix()` patches the file with an empty-list guard
-5. `LocalTestRunner.run_tests()` validates the fix passes
-6. `MockGitHubClient.create_pull_request()` simulates opening a draft PR
-7. Cleans up the temporary file
+Then drive it:
 
-**Expected output:**
+```bash
+# submit (runs synchronously when no broker is configured)
+curl -X POST localhost:8000/issues/process -H 'content-type: application/json' \
+     -d '{"issue_id":101,"repo":"octocat/demo","sync":true}'
+
+# inspect
+curl localhost:8000/runs
+curl localhost:8000/audit
+
+# approve -> opens the draft PR
+curl -X POST localhost:8000/issues/101/approve
 ```
---- Running GitHub Issue-to-PR Agent Sim ---
-Agent Plan:
- Plan for Issue #101:
-1. Inspect src/calculator.py
-2. Add empty list check in sum() method to return 0
-3. Run test suite to verify success.
-Applying fix to calculator.py...
-Tests passed: True
-PR Created: https://github.com/mock-repo/pulls/42
-```
+
+### Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/issues/process` | Submit an issue (async via Celery, or `sync=true`/no-broker fallback) |
+| `POST` | `/issues/{id}/approve` | Approve a run awaiting approval and open a **draft** PR |
+| `GET` | `/runs` | List recent runs |
+| `GET` | `/runs/{id}` | Single run detail (plan, files changed, test outcome, PR URL) |
+| `GET` | `/audit` | Append-only audit trail (filterable by `run_id`) |
+| `GET` | `/health` | Service + dependency health |
 
 ## Tests
 
 ```bash
-make test
+.venv/Scripts/python -m pytest -q
 ```
 
-Current test coverage:
-- **`tests/test_core.py`** — validates the `/health` endpoint returns 200 with correct service name (`github-issue-pr-agent`) and dependency status object
+Coverage spans every core module (planner, editor, git ops, test runner, store, sandbox, GitHub client, db probe), the end-to-end pipeline on `demo_repo`, every API endpoint (success + error), the Celery task (no broker), the safety guards (allowlist / blocklist / traversal / no-main / approval gate), and golden cases for the deterministic planner output. Nothing requires the network, a database, or API keys.
 
-Planned test coverage:
-- Unit tests for `CodePlanner.plan_changes()` with various issue formats
-- Unit tests for `CodeEditor.apply_fix()` with allowlist enforcement
-- Integration tests for the full pipeline with mocked GitHub API
-- Safety tests verifying that disallowed paths and repos are rejected
+> Note: several tests spawn a real `pytest` subprocess against the sandbox, so the full suite takes a few minutes.
 
-## API Reference
+## Known limitations
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/health` | Returns service health with database and Redis connectivity status |
-
-**Planned endpoints:**
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/issues/process` | Submit a GitHub issue URL for agent processing |
-| `GET` | `/issues/{id}/status` | Check processing status of a submitted issue |
-| `GET` | `/issues/{id}/plan` | Retrieve the generated implementation plan |
-| `GET` | `/audit/log` | Query the audit trail of agent actions |
-| `POST` | `/issues/{id}/approve` | Human approval gate before PR creation |
-
-## Configuration
-
-Key environment variables from `.env.example`:
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `APP_NAME` | Service identifier in logs and health checks | `github-issue-pr-agent` |
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql+psycopg://postgres:postgres@localhost:5432/postgres` |
-| `REDIS_URL` | Redis connection for Celery broker and result backend | `redis://localhost:6379/0` |
-| `GITHUB_TOKEN` | Personal access token for GitHub API (requires `repo` scope) | — |
-| `OPENAI_API_KEY` | LLM provider for plan generation | — |
-| `DEBUG` | Enable hot-reload and verbose logging | `true` |
-| `LOG_LEVEL` | Logging verbosity | `INFO` |
-
-## Known Limitations
-
-- **Mock-only GitHub client** — `MockGitHubClient` returns hardcoded data; real GitHub API integration is not yet wired
-- **Hardcoded fix logic** — `CodeEditor.apply_fix()` performs a string replacement rather than LLM-driven code generation
-- **No allowlist enforcement** — the path/repo allowlist safety layer is designed but not yet implemented in code
-- **Test runner is a stub** — `LocalTestRunner.run_tests()` always returns `True` without executing any actual tests
-- **No audit persistence** — audit log storage to PostgreSQL is planned but not implemented
-- **No approval gate** — human-in-the-loop approval flow is designed but not yet present in the API
-- **Single-issue processing** — no batch processing or webhook-triggered pipeline yet
-- **Template CI** — GitHub Actions workflow uses the shared template and may fail on `shared-core` import in isolated CI
+- **The "fix" is a fixed strategy, not free-form codegen.** The agent applies a deterministic `FixStrategy` (search/replace) so the offline demo is repeatable and auditable. The planner produces a real (sim or LLM) plan, but applying arbitrary model-generated patches is intentionally out of scope here — see the roadmap.
+- **No Docker/network isolation of the sandbox yet.** Edits happen in a temp-dir copy with path containment, but test execution runs on the host. A network-isolated container sandbox is the next hardening step.
+- **Single-file fixes.** The current strategy and target-file inference handle one file per run.
+- **Real GitHub paths are wired but exercised via mocks in CI** (no live token in the offline test suite).
 
 ## Roadmap
 
-- [x] **Phase 0** — Project skeleton with FastAPI, health check, Docker Compose, CI
-- [ ] **Phase 1** — Real GitHub API client, issue fetching by label, branch creation
-- [ ] **Phase 2** — LLM-powered plan generation with Hermes agent framework
-- [ ] **Phase 3** — Sandboxed code editing with allowlist enforcement and audit logging
-- [ ] **Phase 4** — Subprocess test runner with output parsing and failure classification
-- [ ] **Phase 5** — Draft PR creation with structured summary and risk assessment
-- [ ] **Phase 6** — Human approval API endpoint and webhook integration
-- [ ] **Phase 7** — Demo repository with before/after walkthrough and screenshots
+1. **Patch application from the LLM plan** — let the model propose edits, validated against the same safety gate before they touch disk.
+2. **Containerized sandbox** — run edit + test inside an ephemeral, network-isolated container.
+3. **Multi-file refactors** — plan and edit across several files with dependency awareness.
+4. **Webhook trigger** — process issues automatically on a label, with rate limiting.
+5. **Self-correction loop** — on a failing test run, re-plan and retry within a bounded budget.
 
-## Related Projects
-
-This project is part of a [multi-project AI infrastructure showcase](../). It integrates with:
-
-- **[hermes-agent-framework](../hermes-agent-framework/)** — provides the agent orchestration framework for chaining planner → editor → tester steps
-- **[async-workflow-engine](../async-workflow-engine/)** — workflow definition and execution engine for the issue processing pipeline
-- **[llm-cost-latency-monitor](../llm-cost-latency-monitor/)** — tracks LLM API costs and latency for plan generation calls
-- **[shared-core](../shared-core/)** — config, database, Redis, logging, and error handling utilities
+See [`docs/`](docs/) for the architecture, design decisions, failure modes, security model, and the execution plan.
